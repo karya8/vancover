@@ -283,7 +283,7 @@ BEGIN
     IF EXISTS (SELECT 1 FROM sys.traces WHERE path LIKE N'%Spectrum[_]ctx[_]%') RETURN;
 
     DECLARE @t1 int, @t2 int, @rc int, @on bit, @maxsize bigint, @dbid int,
-            @stamp nvarchar(20), @f1 nvarchar(245), @f2 nvarchar(245), @c int;
+            @stamp nvarchar(20), @f1 nvarchar(245), @f2 nvarchar(245), @c int, @col int;
     SET @on = 1;
     SET @maxsize = 256;
     SET @dbid = DB_ID('spectrum_prd_fss');
@@ -296,28 +296,31 @@ BEGIN
     EXEC @rc = sp_trace_create @t2 OUTPUT, 2, @f2, @maxsize, NULL, 20;
     IF @rc <> 0 BEGIN RAISERROR('xdb trace create failed: %d', 16, 1, @rc); RETURN; END
 
-    -- 1 TextData, 3 DatabaseID, 6 NTUserName, 7 NTDomainName, 8 HostName,
-    -- 10 ApplicationName, 11 LoginName, 14 StartTime, 35 DatabaseName
-    DECLARE @cols TABLE (c int);
-    INSERT INTO @cols VALUES (1), (3), (6), (7), (8), (10), (11), (14), (35);
-    DECLARE col_cur CURSOR LOCAL FAST_FORWARD FOR SELECT c FROM @cols;
-    OPEN col_cur;
-    FETCH NEXT FROM col_cur INTO @c;
-    WHILE @@FETCH_STATUS = 0
+    -- Events: 10 RPC:Completed, 12 SQL:BatchCompleted
+    -- Columns: 1 TextData, 3 DatabaseID, 6 NTUserName, 7 NTDomainName, 8 HostName,
+    --          10 ApplicationName, 11 LoginName, 14 StartTime, 35 DatabaseName
+    SET @c = 0;
+    WHILE @c < 9
     BEGIN
-        EXEC sp_trace_setevent @t1, 10, @c, @on;  EXEC sp_trace_setevent @t1, 12, @c, @on;
-        EXEC sp_trace_setevent @t2, 10, @c, @on;  EXEC sp_trace_setevent @t2, 12, @c, @on;
-        FETCH NEXT FROM col_cur INTO @c;
-    END
-    CLOSE col_cur; DEALLOCATE col_cur;
+        SET @c = @c + 1;
+        SET @col = CASE @c WHEN 1 THEN 1  WHEN 2 THEN 3  WHEN 3 THEN 6
+                           WHEN 4 THEN 7  WHEN 5 THEN 8  WHEN 6 THEN 10
+                           WHEN 7 THEN 11 WHEN 8 THEN 14 ELSE 35 END;
+        EXEC sp_trace_setevent @t1, 10, @col, @on;
+        EXEC sp_trace_setevent @t1, 12, @col, @on;
+        EXEC sp_trace_setevent @t2, 10, @col, @on;
+        EXEC sp_trace_setevent @t2, 12, @col, @on;
+    END;
 
-    EXEC sp_trace_setfilter @t1, 3, 0, 0, @dbid;                     -- DatabaseID = spectrum_prd_fss
-    EXEC sp_trace_setfilter @t2, 1, 0, 6, N'%spectrum_prd_fss%';     -- TextData LIKE
-    EXEC sp_trace_setfilter @t2, 3, 0, 1, @dbid;                     -- DatabaseID <> spectrum_prd_fss
+    -- ctx: DatabaseID = spectrum_prd_fss
+    EXEC sp_trace_setfilter @t1, 3, 0, 0, @dbid;
+    -- xdb: TextData LIKE '%spectrum_prd_fss%' and DatabaseID <> spectrum_prd_fss
+    EXEC sp_trace_setfilter @t2, 1, 0, 6, N'%spectrum_prd_fss%';
+    EXEC sp_trace_setfilter @t2, 3, 0, 1, @dbid;
 
     EXEC sp_trace_setstatus @t1, 1;
     EXEC sp_trace_setstatus @t2, 1;
-END
+END;
 
 -- then:
 EXEC dbo.usp_start_spectrum_traces;
@@ -343,23 +346,33 @@ CREATE TABLE dbo.spectrum_trace_load (
 DECLARE @files TABLE (subdirectory nvarchar(260), depth int, isfile bit);
 INSERT INTO @files EXEC master.sys.xp_dirtree N'<TracePath>', 1, 1;
 
-DECLARE @f nvarchar(260), @p nvarchar(260);
-DECLARE f_cur CURSOR LOCAL FAST_FORWARD FOR
-    SELECT subdirectory FROM @files
-    WHERE  isfile = 1
-      AND  subdirectory LIKE N'Spectrum[_]___[_]________[_]____.trc';   -- first file of each set
-OPEN f_cur;
-FETCH NEXT FROM f_cur INTO @f;
-WHILE @@FETCH_STATUS = 0
+-- First file of each trace set; fn_trace_gettable reads its rollover files too
+DECLARE @todo TABLE (id int IDENTITY(1,1), file_name nvarchar(260));
+INSERT INTO @todo (file_name)
+SELECT subdirectory
+FROM   @files
+WHERE  isfile = 1
+  AND  subdirectory LIKE N'Spectrum[_]___[_]________[_]____.trc';
+
+DECLARE @i int, @n int, @f nvarchar(260), @p nvarchar(260);
+SET @i = 1;
+SELECT @n = COUNT(*) FROM @todo;
+
+WHILE @i <= @n
 BEGIN
+    SELECT @f = file_name FROM @todo WHERE id = @i;
     SET @p = N'<TracePath>\' + @f;
+
     INSERT INTO dbo.spectrum_trace_load
     SELECT @f, LoginName, NTDomainName, NTUserName, HostName, ApplicationName,
            DatabaseName, StartTime, CAST(TextData AS nvarchar(max))
     FROM   fn_trace_gettable(@p, DEFAULT);
-    FETCH NEXT FROM f_cur INTO @f;
-END
-CLOSE f_cur; DEALLOCATE f_cur;
+
+    SET @i = @i + 1;
+END;
+
+-- Check: rows loaded per trace set
+SELECT trace_set, COUNT(*) AS rows_loaded FROM dbo.spectrum_trace_load GROUP BY trace_set;
 
 SELECT l.LoginName, l.NTDomainName + '\' + l.NTUserName AS windows_user,
        l.HostName, l.ApplicationName, l.DatabaseName AS context_db,
